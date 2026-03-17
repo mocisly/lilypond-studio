@@ -1,10 +1,10 @@
 use crate::render::{RenderOutcome, RenderedPage, render_score};
-use crate::tutorial::{LESSONS, TutorialLesson, default_source};
+use crate::scores::{ScoreManager, SqliteScoreStore};
+use crate::tutorial::{LESSONS, TutorialLesson};
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, App, Application, Bounds, Context, Entity, FontWeight, KeyBinding, Menu,
-    MenuItem, SharedString, Subscription, Window, WindowBounds, WindowOptions, actions, div,
-    img, px, size,
+    AnyElement, App, Application, Bounds, Context, Entity, FontWeight, KeyBinding, Menu, MenuItem,
+    SharedString, Subscription, Window, WindowBounds, WindowOptions, actions, div, img, px, size,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
@@ -12,10 +12,11 @@ use gpui_component::scroll::ScrollableElement as _;
 use gpui_component::text::TextView;
 use gpui_component::{ActiveTheme, Disableable, Icon, IconName, Root, Sizable, TitleBar};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 actions!(studio, [Quit]);
 
-pub fn run(render_root: PathBuf) {
+pub fn run(render_root: PathBuf, database_path: PathBuf) {
     Application::new().run(move |cx: &mut App| {
         gpui_component::init(cx);
         cx.on_action(|_: &Quit, cx| cx.quit());
@@ -28,7 +29,12 @@ pub fn run(render_root: PathBuf) {
             items: vec![MenuItem::action("Quit", Quit)],
         }]);
 
+        #[cfg(target_os = "windows")]
+        let bounds = Bounds::centered(None, size(px(1280.0), px(820.0)), cx);
+        #[cfg(target_os = "macos")]
         let bounds = Bounds::centered(None, size(px(1440.0), px(940.0)), cx);
+        #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+        let bounds = Bounds::centered(None, size(px(1360.0), px(900.0)), cx);
         #[cfg(target_os = "linux")]
         let window_options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -42,17 +48,17 @@ pub fn run(render_root: PathBuf) {
             titlebar: Some(TitleBar::title_bar_options()),
             ..Default::default()
         };
-        cx.open_window(
-            window_options,
-            {
-                let render_root = render_root.clone();
-                move |window, cx| {
-                    let studio = cx.new(|cx| StudioApp::new(render_root.clone(), window, cx));
-                    let _ = studio.update(cx, |studio, cx| studio.begin_render(cx));
-                    cx.new(|cx| Root::new(studio, window, cx))
-                }
-            },
-        )
+        cx.open_window(window_options, {
+            let render_root = render_root.clone();
+            let database_path = database_path.clone();
+            move |window, cx| {
+                let studio = cx.new(|cx| {
+                    StudioApp::new(render_root.clone(), database_path.clone(), window, cx)
+                });
+                let _ = studio.update(cx, |studio, cx| studio.begin_render(cx));
+                cx.new(|cx| Root::new(studio, window, cx))
+            }
+        })
         .expect("failed to open the LilyPond Studio window");
 
         cx.activate(true);
@@ -67,8 +73,17 @@ enum RenderPhase {
     Error,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AppScreen {
+    Studio,
+    Scores,
+}
+
 struct StudioApp {
     editor: Entity<InputState>,
+    score_title: Entity<InputState>,
+    score_manager: ScoreManager,
+    current_screen: AppScreen,
     tutorial_index: usize,
     render_phase: RenderPhase,
     render_root: PathBuf,
@@ -79,6 +94,7 @@ struct StudioApp {
     preview_zoom: f32,
     render_log: SharedString,
     dirty: bool,
+    suppress_input_sync: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -88,7 +104,19 @@ impl StudioApp {
     const MAX_PREVIEW_ZOOM: f32 = 3.0;
     const PREVIEW_ZOOM_STEP: f32 = 0.25;
 
-    fn new(render_root: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(
+        render_root: PathBuf,
+        database_path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let store = Arc::new(
+            SqliteScoreStore::open(&database_path).expect("failed to open the score database"),
+        );
+        let score_manager =
+            ScoreManager::load(store).expect("failed to initialize the score manager");
+        let initial_score = score_manager.selected_score().clone();
+
         let editor = cx.new(|cx| {
             InputState::new(window, cx)
                 .code_editor("lilypond")
@@ -96,21 +124,53 @@ impl StudioApp {
                 .rows(28)
                 .soft_wrap(false)
                 .placeholder("Write LilyPond notation here and render it to SVG.")
-                .default_value(default_source())
+                .default_value(initial_score.source.clone())
         });
 
-        let subscriptions =
-            vec![
-                cx.subscribe_in(&editor, window, |this, _, event: &InputEvent, _, cx| {
-                    if matches!(event, InputEvent::Change) {
-                        this.dirty = true;
-                        cx.notify();
+        let score_title = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Score title")
+                .default_value(initial_score.title.clone())
+        });
+
+        let subscriptions = vec![
+            cx.subscribe_in(&editor, window, |this, _, event: &InputEvent, _, cx| {
+                if !matches!(event, InputEvent::Change) || this.suppress_input_sync {
+                    return;
+                }
+
+                let source = this.editor.read(cx).value().to_string();
+                if let Err(err) = this.score_manager.update_selected_source(source) {
+                    this.render_phase = RenderPhase::Error;
+                    this.render_log = format!("{err:#}").into();
+                } else {
+                    this.mark_preview_stale();
+                }
+                cx.notify();
+            }),
+            cx.subscribe_in(
+                &score_title,
+                window,
+                |this, _, event: &InputEvent, _, cx| {
+                    if !matches!(event, InputEvent::Change) || this.suppress_input_sync {
+                        return;
                     }
-                }),
-            ];
+
+                    let title = this.score_title.read(cx).value().to_string();
+                    if let Err(err) = this.score_manager.rename_selected_score(title) {
+                        this.render_phase = RenderPhase::Error;
+                        this.render_log = format!("{err:#}").into();
+                    }
+                    cx.notify();
+                },
+            ),
+        ];
 
         Self {
             editor,
+            score_title,
+            score_manager,
+            current_screen: AppScreen::Scores,
             tutorial_index: 0,
             render_phase: RenderPhase::Idle,
             render_root,
@@ -121,12 +181,38 @@ impl StudioApp {
             preview_zoom: Self::DEFAULT_PREVIEW_ZOOM,
             render_log: SharedString::default(),
             dirty: true,
+            suppress_input_sync: false,
             _subscriptions: subscriptions,
         }
     }
 
     fn current_lesson(&self) -> &'static TutorialLesson {
         &LESSONS[self.tutorial_index]
+    }
+
+    fn score_count_summary(&self) -> String {
+        match self.score_manager.scores().len() {
+            1 => "1 score".to_string(),
+            count => format!("{count} scores"),
+        }
+    }
+
+    fn selected_score_title(&self) -> &str {
+        &self.score_manager.selected_score().title
+    }
+
+    fn show_studio_screen(&mut self, cx: &mut Context<Self>) {
+        if self.current_screen != AppScreen::Studio {
+            self.current_screen = AppScreen::Studio;
+            cx.notify();
+        }
+    }
+
+    fn show_scores_screen(&mut self, cx: &mut Context<Self>) {
+        if self.current_screen != AppScreen::Scores {
+            self.current_screen = AppScreen::Scores;
+            cx.notify();
+        }
     }
 
     fn begin_render(&mut self, cx: &mut Context<Self>) {
@@ -180,12 +266,69 @@ impl StudioApp {
         cx.notify();
     }
 
+    fn mark_preview_stale(&mut self) {
+        self.dirty = true;
+    }
+
+    fn reset_preview_for_score_switch(&mut self) {
+        self.active_render_job = None;
+        self.preview_pages.clear();
+        self.current_preview_page = 0;
+        self.preview_zoom = Self::DEFAULT_PREVIEW_ZOOM;
+        self.render_log = SharedString::default();
+        self.render_phase = RenderPhase::Idle;
+        self.dirty = true;
+    }
+
+    fn sync_selected_score_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let score = self.score_manager.selected_score().clone();
+        self.suppress_input_sync = true;
+        let _ = self
+            .score_title
+            .update(cx, |input, cx| input.set_value(score.title, window, cx));
+        let _ = self
+            .editor
+            .update(cx, |input, cx| input.set_value(score.source, window, cx));
+        self.suppress_input_sync = false;
+    }
+
+    fn select_score(&mut self, score_id: i64, window: &mut Window, cx: &mut Context<Self>) {
+        if self.score_manager.select_score(score_id) {
+            self.sync_selected_score_inputs(window, cx);
+            self.reset_preview_for_score_switch();
+            self.current_screen = AppScreen::Studio;
+            cx.notify();
+        }
+    }
+
+    fn create_score(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Err(err) = self.score_manager.create_score() {
+            self.render_phase = RenderPhase::Error;
+            self.render_log = format!("{err:#}").into();
+        } else {
+            self.sync_selected_score_inputs(window, cx);
+            self.reset_preview_for_score_switch();
+        }
+        cx.notify();
+    }
+
+    fn delete_selected_score(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Err(err) = self.score_manager.delete_selected_score() {
+            self.render_phase = RenderPhase::Error;
+            self.render_log = format!("{err:#}").into();
+        } else {
+            self.sync_selected_score_inputs(window, cx);
+            self.reset_preview_for_score_switch();
+        }
+        cx.notify();
+    }
+
     fn load_current_lesson_example(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let lesson = self.current_lesson();
         let _ = self.editor.update(cx, |editor, cx| {
             editor.set_value(lesson.example, window, cx)
         });
-        self.dirty = true;
+        self.mark_preview_stale();
         cx.notify();
     }
 
@@ -273,7 +416,37 @@ impl StudioApp {
             .into_any_element()
     }
 
-    fn app_header(&self, render_button: Button, cx: &App) -> AnyElement {
+    fn screen_nav_button(&self, id: &'static str, label: &'static str, active: bool) -> Button {
+        let button = Button::new(id).label(label);
+        if active { button.primary() } else { button }
+    }
+
+    fn app_header(&self, view: Entity<Self>, render_button: Button, cx: &App) -> AnyElement {
+        let studio_button = self
+            .screen_nav_button(
+                "show-studio-screen",
+                "Studio",
+                self.current_screen == AppScreen::Studio,
+            )
+            .on_click({
+                let view = view.clone();
+                move |_, _, cx| {
+                    let _ = view.update(cx, |studio, cx| studio.show_studio_screen(cx));
+                }
+            });
+        let scores_button = self
+            .screen_nav_button(
+                "show-scores-screen",
+                "Scores",
+                self.current_screen == AppScreen::Scores,
+            )
+            .on_click({
+                let view = view.clone();
+                move |_, _, cx| {
+                    let _ = view.update(cx, |studio, cx| studio.show_scores_screen(cx));
+                }
+            });
+
         TitleBar::new()
             .child(
                 div()
@@ -315,7 +488,7 @@ impl StudioApp {
                                     .bg(cx.theme().secondary)
                                     .text_size(px(11.0))
                                     .text_color(cx.theme().muted_foreground)
-                                    .child("Render session"),
+                                    .child(self.selected_score_title().to_string()),
                             ),
                     ),
             )
@@ -325,16 +498,15 @@ impl StudioApp {
                     .items_center()
                     .gap_2()
                     .pr(px(12.0))
+                    .child(self.header_chip(IconName::File, self.score_count_summary(), cx))
                     .child(self.header_chip(
                         IconName::BookOpen,
                         format!("Lesson {} of {}", self.tutorial_index + 1, LESSONS.len()),
                         cx,
                     ))
-                    .child(self.header_chip(
-                        IconName::File,
-                        self.preview_page_summary(),
-                        cx,
-                    ))
+                    .child(self.header_chip(IconName::File, self.preview_page_summary(), cx))
+                    .child(studio_button.compact())
+                    .child(scores_button.compact())
                     .child(self.render_badge(cx))
                     .child(render_button.compact()),
             )
@@ -381,13 +553,14 @@ impl StudioApp {
     fn render_detail(&self) -> String {
         match self.render_phase {
             RenderPhase::Idle => {
-                "Edit the score on the left, then compile it with the LilyPond CLI.".to_string()
+                "Edit the score in the center pane, then compile it with the LilyPond CLI."
+                    .to_string()
             }
             RenderPhase::Rendering => {
                 "Running LilyPond and collecting the generated SVG pages.".to_string()
             }
             RenderPhase::Ready if self.dirty => format!(
-                "{} page(s) rendered. The editor changed since the last successful render.",
+                "{} page(s) rendered. The current score changed since the last successful render.",
                 self.preview_pages.len()
             ),
             RenderPhase::Ready => format!(
@@ -398,6 +571,367 @@ impl StudioApp {
                 "LilyPond returned an error. Fix the notation and render again.".to_string()
             }
         }
+    }
+
+    fn score_library_screen(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        previous_lesson: Button,
+        next_lesson: Button,
+        load_example: Button,
+    ) -> AnyElement {
+        let view = cx.entity();
+        let selected_id = self.score_manager.selected_score_id();
+        let can_delete = !self.score_manager.scores().is_empty();
+
+        let score_list = self.score_manager.scores().iter().fold(
+            div().flex().flex_col().gap_2(),
+            |list, score| {
+                let is_selected = score.id == selected_id;
+                let mut button =
+                    Button::new(("score-item", score.id as u64)).label(score.title.clone());
+                if is_selected {
+                    button = button.primary();
+                }
+
+                list.child(button.on_click({
+                    let view = view.clone();
+                    let score_id = score.id;
+                    move |_, window, cx| {
+                        let _ =
+                            view.update(cx, |studio, cx| studio.select_score(score_id, window, cx));
+                    }
+                }))
+            },
+        );
+
+        let create_button = Button::new("create-score").label("Create").on_click({
+            let view = view.clone();
+            move |_, window, cx| {
+                let _ = view.update(cx, |studio, cx| studio.create_score(window, cx));
+            }
+        });
+
+        let delete_button = Button::new("delete-score")
+            .label("Delete")
+            .disabled(!can_delete)
+            .on_click({
+                let view = view.clone();
+                move |_, window, cx| {
+                    let _ = view.update(cx, |studio, cx| studio.delete_selected_score(window, cx));
+                }
+            });
+
+        div()
+            .flex()
+            .flex_1()
+            .min_h(px(0.0))
+            .gap_4()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .p_4()
+                    .bg(cx.theme().secondary)
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_size(px(16.0))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child("Score Library"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(13.0))
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(
+                                        "Browse the local score library on its own screen, switch between pieces, and keep the editor bound to the selected score.",
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_end()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .flex_col()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .text_size(px(12.0))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .child("Rename Current Score"),
+                                    )
+                                    .child(Input::new(&self.score_title)),
+                            )
+                            .child(create_button)
+                            .child(delete_button),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child("Library"),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_h(px(0.0))
+                                    .overflow_y_scrollbar()
+                                    .child(score_list),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_start()
+                            .gap_2()
+                            .p_3()
+                            .bg(cx.theme().muted)
+                            .rounded(px(12.0))
+                            .child(
+                                Icon::new(IconName::Info)
+                                    .small()
+                                    .text_color(cx.theme().muted_foreground),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(format!(
+                                        "Current score: \"{}\" (id {}). Lesson examples overwrite the current score source.",
+                                        self.selected_score_title(),
+                                        selected_id
+                                    )),
+                            ),
+                    ),
+            )
+            .child(self.tutorial_panel(window, cx, previous_lesson, next_lesson, load_example))
+            .into_any_element()
+    }
+
+    fn tutorial_panel(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        previous_lesson: Button,
+        next_lesson: Button,
+        load_example: Button,
+    ) -> AnyElement {
+        let lesson = self.current_lesson();
+        let theme = cx.theme();
+
+        div()
+            .flex_1()
+            .min_w(px(0.0))
+            .flex()
+            .flex_col()
+            .gap_3()
+            .p_4()
+            .bg(theme.secondary)
+            .border_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .flex()
+                    .items_start()
+                    .justify_between()
+                    .gap_3()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_size(px(16.0))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child("Tutorial"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(13.0))
+                                    .text_color(theme.muted_foreground)
+                                    .child(format!(
+                                        "Lesson {} of {}: {}",
+                                        self.tutorial_index + 1,
+                                        LESSONS.len(),
+                                        lesson.title
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .text_color(theme.muted_foreground)
+                                    .child(lesson.summary),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(previous_lesson)
+                            .child(next_lesson)
+                            .child(load_example),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .overflow_hidden()
+                    .child(
+                        TextView::markdown("tutorial-markdown", lesson.markdown, window, cx)
+                            .scrollable(true)
+                            .selectable(true)
+                            .size_full(),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn studio_screen(
+        &self,
+        cx: &mut Context<Self>,
+        previous_page: Button,
+        next_page: Button,
+        zoom_out: Button,
+        reset_zoom: Button,
+        zoom_in: Button,
+        preview_meta: String,
+    ) -> AnyElement {
+        let theme = cx.theme();
+
+        div()
+            .flex()
+            .flex_1()
+            .min_h(px(0.0))
+            .gap_4()
+            .p_4()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .p_4()
+                    .bg(theme.secondary)
+                    .border_1()
+                    .border_color(theme.border)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_size(px(16.0))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child("Score Editor"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(13.0))
+                                    .text_color(theme.muted_foreground)
+                                    .child(
+                                        "The editor is a GPUI-native multiline input bound to the selected score. `Cmd/Ctrl+F` opens in-editor search, and each render writes a fresh LilyPond job workspace.",
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_h(px(0.0))
+                            .child(Input::new(&self.editor).h_full()),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .flex()
+                    .flex_col()
+                    .gap_4()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_h(px(0.0))
+                            .gap_3()
+                            .p_4()
+                            .bg(theme.secondary)
+                            .border_1()
+                            .border_color(theme.border)
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_start()
+                                    .justify_between()
+                                    .gap_3()
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .gap_1()
+                                            .child(
+                                                div()
+                                                    .text_size(px(16.0))
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .child("SVG Preview"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_size(px(13.0))
+                                                    .text_color(theme.muted_foreground)
+                                                    .child(self.render_detail()),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .child(zoom_out)
+                                            .child(reset_zoom)
+                                            .child(zoom_in)
+                                            .child(previous_page)
+                                            .child(
+                                                div()
+                                                    .text_size(px(12.0))
+                                                    .text_color(theme.muted_foreground)
+                                                    .child(preview_meta),
+                                            )
+                                            .child(next_page),
+                                    ),
+                            )
+                            .child(self.preview_surface(cx))
+                            .when(!self.render_log.is_empty(), |this| {
+                                this.child(self.render_log_panel(cx))
+                            }),
+                    ),
+            )
+            .into_any_element()
     }
 
     fn preview_surface(&self, cx: &App) -> AnyElement {
@@ -430,7 +964,7 @@ impl StudioApp {
         let message = if self.render_phase == RenderPhase::Error {
             "No SVG preview is available because the latest render failed."
         } else {
-            "Render the score to generate an SVG preview here."
+            "Render the selected score to generate an SVG preview here."
         };
 
         div()
@@ -487,8 +1021,6 @@ impl StudioApp {
 impl Render for StudioApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let view = cx.entity();
-        let theme = cx.theme();
-        let lesson = self.current_lesson();
         let render_is_running = self.render_phase == RenderPhase::Rendering;
         let has_preview = !self.preview_pages.is_empty();
 
@@ -598,6 +1130,31 @@ impl Render for StudioApp {
                 self.preview_pages.len()
             )
         };
+        let body = match self.current_screen {
+            AppScreen::Studio => self.studio_screen(
+                cx,
+                previous_page,
+                next_page,
+                zoom_out,
+                reset_zoom,
+                zoom_in,
+                preview_meta,
+            ),
+            AppScreen::Scores => div()
+                .flex()
+                .flex_1()
+                .min_h(px(0.0))
+                .p_4()
+                .child(self.score_library_screen(
+                    window,
+                    cx,
+                    previous_lesson,
+                    next_lesson,
+                    load_example,
+                ))
+                .into_any_element(),
+        };
+        let theme = cx.theme();
 
         div()
             .flex()
@@ -606,187 +1163,7 @@ impl Render for StudioApp {
             .bg(theme.background)
             .text_color(theme.foreground)
             .font_family(theme.font_family.clone())
-            .child(self.app_header(render_button, cx))
-            .child(
-                div()
-                    .flex()
-                    .flex_1()
-                    .min_h(px(0.0))
-                    .gap_4()
-                    .p_4()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .flex()
-                            .flex_col()
-                            .gap_3()
-                            .p_4()
-                            .bg(theme.secondary)
-                            .border_1()
-                            .border_color(theme.border)
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_1()
-                                    .child(
-                                        div()
-                                            .text_size(px(16.0))
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .child("Score Editor"),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(13.0))
-                                            .text_color(theme.muted_foreground)
-                                            .child(
-                                                "The editor is a GPUI-native multiline input. `Cmd/Ctrl+F` opens in-editor search, and each render writes a fresh LilyPond job workspace.",
-                                            ),
-                                    ),
-                            )
-                            .child(div().flex_1().min_h(px(0.0)).child(Input::new(&self.editor).h_full())),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .flex()
-                            .flex_col()
-                            .gap_4()
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .flex_1()
-                                    .min_h(px(0.0))
-                                    .gap_3()
-                                    .p_4()
-                                    .bg(theme.secondary)
-                                    .border_1()
-                                    .border_color(theme.border)
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .items_start()
-                                            .justify_between()
-                                            .gap_3()
-                                            .child(
-                                                div()
-                                                    .flex()
-                                                    .flex_col()
-                                                    .gap_1()
-                                                    .child(
-                                                        div()
-                                                            .text_size(px(16.0))
-                                                            .font_weight(FontWeight::SEMIBOLD)
-                                                            .child("SVG Preview"),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .text_size(px(13.0))
-                                                            .text_color(theme.muted_foreground)
-                                                            .child(self.render_detail()),
-                                                    ),
-                                            )
-                                            .child(
-                                                div()
-                                                    .flex()
-                                                    .items_center()
-                                                    .gap_2()
-                                                    .child(zoom_out)
-                                                    .child(reset_zoom)
-                                                    .child(zoom_in)
-                                                    .child(previous_page)
-                                                    .child(
-                                                        div()
-                                                            .text_size(px(12.0))
-                                                            .text_color(theme.muted_foreground)
-                                                            .child(preview_meta),
-                                                    )
-                                                    .child(next_page),
-                                            ),
-                                    )
-                                    .child(self.preview_surface(cx))
-                                    .when(!self.render_log.is_empty(), |this| {
-                                        this.child(self.render_log_panel(cx))
-                                    }),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .h(px(360.0))
-                                    .min_h(px(300.0))
-                                    .gap_3()
-                                    .p_4()
-                                    .bg(theme.secondary)
-                                    .border_1()
-                                    .border_color(theme.border)
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .items_start()
-                                            .justify_between()
-                                            .gap_3()
-                                            .child(
-                                                div()
-                                                    .flex()
-                                                    .flex_col()
-                                                    .gap_1()
-                                                    .child(
-                                                        div()
-                                                            .text_size(px(16.0))
-                                                            .font_weight(FontWeight::SEMIBOLD)
-                                                            .child("Tutorial"),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .text_size(px(13.0))
-                                                            .text_color(theme.muted_foreground)
-                                                            .child(format!(
-                                                                "Lesson {} of {}: {}",
-                                                                self.tutorial_index + 1,
-                                                                LESSONS.len(),
-                                                                lesson.title
-                                                            )),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .text_size(px(12.0))
-                                                            .text_color(theme.muted_foreground)
-                                                            .child(lesson.summary),
-                                                    ),
-                                            )
-                                            .child(
-                                                div()
-                                                    .flex()
-                                                    .items_center()
-                                                    .gap_2()
-                                                    .child(previous_lesson)
-                                                    .child(next_lesson)
-                                                    .child(load_example),
-                                            ),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_h(px(0.0))
-                                            .overflow_hidden()
-                                            .child(
-                                                TextView::markdown(
-                                                    "tutorial-markdown",
-                                                    lesson.markdown,
-                                                    window,
-                                                    cx,
-                                                )
-                                                .scrollable(true)
-                                                .selectable(true)
-                                                .size_full(),
-                                            ),
-                                    ),
-                            ),
-                    ),
-            )
+            .child(self.app_header(view.clone(), render_button, cx))
+            .child(body)
     }
 }

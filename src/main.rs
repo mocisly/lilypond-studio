@@ -1,5 +1,6 @@
 mod app;
 mod render;
+mod scores;
 mod tutorial;
 
 use std::fs;
@@ -9,7 +10,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 fn main() {
     let render_root = session_render_root();
     fs::create_dir_all(&render_root).expect("failed to create the render workspace");
-    app::run(render_root);
+    let database_path = scores::default_database_path();
+    app::run(render_root, database_path);
 }
 
 fn session_render_root() -> PathBuf {

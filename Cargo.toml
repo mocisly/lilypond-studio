@@ -5,5 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0"
+async-std = "1.13"
 gpui = { version = "0.2.2", features = ["runtime_shaders"] }
 gpui-component = "0.5.1"
+sqlx = { version = "0.8", default-features = false, features = ["sqlite", "runtime-async-std-rustls"] }
