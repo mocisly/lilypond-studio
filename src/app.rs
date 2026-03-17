@@ -1,6 +1,6 @@
-use crate::render::{RenderOutcome, RenderedPage, render_score};
+use crate::render::{render_score, RenderOutcome, RenderedPage};
 use crate::scores::{ScoreManager, SqliteScoreStore};
-use crate::tutorial::{LESSONS, TutorialLesson};
+use crate::tutorial::LESSONS;
 use gpui::prelude::*;
 use gpui::{
     AnyElement, App, Application, Bounds, Context, Entity, FontWeight, KeyBinding, Menu, MenuItem,
@@ -9,7 +9,6 @@ use gpui::{
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::scroll::ScrollableElement as _;
-use gpui_component::text::TextView;
 use gpui_component::{ActiveTheme, Disableable, Icon, IconName, Root, Sizable, TitleBar};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -79,12 +78,18 @@ enum AppScreen {
     Scores,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ActiveDocument {
+    Score(i64),
+    Tutorial(usize),
+}
+
 struct StudioApp {
     editor: Entity<InputState>,
     score_title: Entity<InputState>,
     score_manager: ScoreManager,
     current_screen: AppScreen,
-    tutorial_index: usize,
+    active_document: ActiveDocument,
     render_phase: RenderPhase,
     render_root: PathBuf,
     next_render_job: u64,
@@ -139,10 +144,14 @@ impl StudioApp {
                     return;
                 }
 
-                let source = this.editor.read(cx).value().to_string();
-                if let Err(err) = this.score_manager.update_selected_source(source) {
-                    this.render_phase = RenderPhase::Error;
-                    this.render_log = format!("{err:#}").into();
+                if matches!(this.active_document, ActiveDocument::Score(_)) {
+                    let source = this.editor.read(cx).value().to_string();
+                    if let Err(err) = this.score_manager.update_selected_source(source) {
+                        this.render_phase = RenderPhase::Error;
+                        this.render_log = format!("{err:#}").into();
+                    } else {
+                        this.mark_preview_stale();
+                    }
                 } else {
                     this.mark_preview_stale();
                 }
@@ -157,9 +166,11 @@ impl StudioApp {
                     }
 
                     let title = this.score_title.read(cx).value().to_string();
-                    if let Err(err) = this.score_manager.rename_selected_score(title) {
-                        this.render_phase = RenderPhase::Error;
-                        this.render_log = format!("{err:#}").into();
+                    if let ActiveDocument::Score(_) = this.active_document {
+                        if let Err(err) = this.score_manager.rename_selected_score(title) {
+                            this.render_phase = RenderPhase::Error;
+                            this.render_log = format!("{err:#}").into();
+                        }
                     }
                     cx.notify();
                 },
@@ -171,7 +182,7 @@ impl StudioApp {
             score_title,
             score_manager,
             current_screen: AppScreen::Scores,
-            tutorial_index: 0,
+            active_document: ActiveDocument::Score(initial_score.id),
             render_phase: RenderPhase::Idle,
             render_root,
             next_render_job: 0,
@@ -186,19 +197,29 @@ impl StudioApp {
         }
     }
 
-    fn current_lesson(&self) -> &'static TutorialLesson {
-        &LESSONS[self.tutorial_index]
-    }
-
-    fn score_count_summary(&self) -> String {
-        match self.score_manager.scores().len() {
-            1 => "1 score".to_string(),
-            count => format!("{count} scores"),
+    fn file_count_summary(&self) -> String {
+        match self.score_manager.scores().len() + LESSONS.len() {
+            1 => "1 file".to_string(),
+            count => format!("{count} files"),
         }
     }
 
-    fn selected_score_title(&self) -> &str {
-        &self.score_manager.selected_score().title
+    fn tutorial_count_summary(&self) -> String {
+        match LESSONS.len() {
+            1 => "1 tutorial".to_string(),
+            count => format!("{count} tutorials"),
+        }
+    }
+
+    fn selected_document_title(&self) -> &str {
+        match self.active_document {
+            ActiveDocument::Score(_) => &self.score_manager.selected_score().title,
+            ActiveDocument::Tutorial(index) => LESSONS[index].title,
+        }
+    }
+
+    fn is_tutorial_active(&self) -> bool {
+        matches!(self.active_document, ActiveDocument::Tutorial(_))
     }
 
     fn show_studio_screen(&mut self, cx: &mut Context<Self>) {
@@ -294,6 +315,7 @@ impl StudioApp {
 
     fn select_score(&mut self, score_id: i64, window: &mut Window, cx: &mut Context<Self>) {
         if self.score_manager.select_score(score_id) {
+            self.active_document = ActiveDocument::Score(score_id);
             self.sync_selected_score_inputs(window, cx);
             self.reset_preview_for_score_switch();
             self.current_screen = AppScreen::Studio;
@@ -301,11 +323,33 @@ impl StudioApp {
         }
     }
 
+    fn open_tutorial(
+        &mut self,
+        tutorial_index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let lesson = &LESSONS[tutorial_index];
+        self.active_document = ActiveDocument::Tutorial(tutorial_index);
+        self.suppress_input_sync = true;
+        let _ = self
+            .score_title
+            .update(cx, |input, cx| input.set_value(lesson.title, window, cx));
+        let _ = self
+            .editor
+            .update(cx, |input, cx| input.set_value(lesson.example, window, cx));
+        self.suppress_input_sync = false;
+        self.reset_preview_for_score_switch();
+        self.current_screen = AppScreen::Studio;
+        cx.notify();
+    }
+
     fn create_score(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Err(err) = self.score_manager.create_score() {
             self.render_phase = RenderPhase::Error;
             self.render_log = format!("{err:#}").into();
         } else {
+            self.active_document = ActiveDocument::Score(self.score_manager.selected_score_id());
             self.sync_selected_score_inputs(window, cx);
             self.reset_preview_for_score_switch();
         }
@@ -313,37 +357,19 @@ impl StudioApp {
     }
 
     fn delete_selected_score(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !matches!(self.active_document, ActiveDocument::Score(_)) {
+            return;
+        }
+
         if let Err(err) = self.score_manager.delete_selected_score() {
             self.render_phase = RenderPhase::Error;
             self.render_log = format!("{err:#}").into();
         } else {
+            self.active_document = ActiveDocument::Score(self.score_manager.selected_score_id());
             self.sync_selected_score_inputs(window, cx);
             self.reset_preview_for_score_switch();
         }
         cx.notify();
-    }
-
-    fn load_current_lesson_example(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let lesson = self.current_lesson();
-        let _ = self.editor.update(cx, |editor, cx| {
-            editor.set_value(lesson.example, window, cx)
-        });
-        self.mark_preview_stale();
-        cx.notify();
-    }
-
-    fn previous_lesson(&mut self, cx: &mut Context<Self>) {
-        if self.tutorial_index > 0 {
-            self.tutorial_index -= 1;
-            cx.notify();
-        }
-    }
-
-    fn next_lesson(&mut self, cx: &mut Context<Self>) {
-        if self.tutorial_index + 1 < LESSONS.len() {
-            self.tutorial_index += 1;
-            cx.notify();
-        }
     }
 
     fn previous_preview_page(&mut self, cx: &mut Context<Self>) {
@@ -488,7 +514,7 @@ impl StudioApp {
                                     .bg(cx.theme().secondary)
                                     .text_size(px(11.0))
                                     .text_color(cx.theme().muted_foreground)
-                                    .child(self.selected_score_title().to_string()),
+                                    .child(self.selected_document_title().to_string()),
                             ),
                     ),
             )
@@ -498,10 +524,10 @@ impl StudioApp {
                     .items_center()
                     .gap_2()
                     .pr(px(12.0))
-                    .child(self.header_chip(IconName::File, self.score_count_summary(), cx))
+                    .child(self.header_chip(IconName::File, self.file_count_summary(), cx))
                     .child(self.header_chip(
                         IconName::BookOpen,
-                        format!("Lesson {} of {}", self.tutorial_index + 1, LESSONS.len()),
+                        self.tutorial_count_summary(),
                         cx,
                     ))
                     .child(self.header_chip(IconName::File, self.preview_page_summary(), cx))
@@ -575,20 +601,18 @@ impl StudioApp {
 
     fn score_library_screen(
         &self,
-        window: &mut Window,
         cx: &mut Context<Self>,
-        previous_lesson: Button,
-        next_lesson: Button,
-        load_example: Button,
     ) -> AnyElement {
         let view = cx.entity();
-        let selected_id = self.score_manager.selected_score_id();
-        let can_delete = !self.score_manager.scores().is_empty();
+        let selected_score_id = self.score_manager.selected_score_id();
+        let can_delete = matches!(self.active_document, ActiveDocument::Score(_))
+            && !self.score_manager.scores().is_empty();
 
         let score_list = self.score_manager.scores().iter().fold(
             div().flex().flex_col().gap_2(),
             |list, score| {
-                let is_selected = score.id == selected_id;
+                let is_selected =
+                    matches!(self.active_document, ActiveDocument::Score(id) if id == score.id);
                 let mut button =
                     Button::new(("score-item", score.id as u64)).label(score.title.clone());
                 if is_selected {
@@ -605,6 +629,32 @@ impl StudioApp {
                 }))
             },
         );
+
+        let tutorial_list =
+            LESSONS
+                .iter()
+                .enumerate()
+                .fold(div().flex().flex_col().gap_2(), |list, (index, lesson)| {
+                    let is_selected = matches!(
+                        self.active_document,
+                        ActiveDocument::Tutorial(active) if active == index
+                    );
+                    let mut button = Button::new(("tutorial-item", index as u64))
+                        .label(lesson.title)
+                        .icon(IconName::BookOpen);
+                    if is_selected {
+                        button = button.primary();
+                    }
+
+                    list.child(button.on_click({
+                        let view = view.clone();
+                        move |_, window, cx| {
+                            let _ = view.update(cx, |studio, cx| {
+                                studio.open_tutorial(index, window, cx)
+                            });
+                        }
+                    }))
+                });
 
         let create_button = Button::new("create-score").label("Create").on_click({
             let view = view.clone();
@@ -673,9 +723,12 @@ impl StudioApp {
                                         div()
                                             .text_size(px(12.0))
                                             .font_weight(FontWeight::SEMIBOLD)
-                                            .child("Rename Current Score"),
+                                            .child("File Name"),
                                     )
-                                    .child(Input::new(&self.score_title)),
+                                    .child(
+                                        Input::new(&self.score_title)
+                                            .disabled(self.is_tutorial_active()),
+                                    ),
                             )
                             .child(create_button)
                             .child(delete_button),
@@ -689,7 +742,7 @@ impl StudioApp {
                                 div()
                                     .text_size(px(12.0))
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .child("Library"),
+                                    .child("Scores"),
                             )
                             .child(
                                 div()
@@ -698,6 +751,19 @@ impl StudioApp {
                                     .overflow_y_scrollbar()
                                     .child(score_list),
                             ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child("Tutorial Files"),
+                            )
+                            .child(tutorial_list),
                     )
                     .child(
                         div()
@@ -716,94 +782,16 @@ impl StudioApp {
                                 div()
                                     .text_size(px(12.0))
                                     .text_color(cx.theme().muted_foreground)
-                                    .child(format!(
-                                        "Current score: \"{}\" (id {}). Lesson examples overwrite the current score source.",
-                                        self.selected_score_title(),
-                                        selected_id
-                                    )),
+                                    .child(if self.is_tutorial_active() {
+                                        "Tutorial files open directly in the editor and can be rendered immediately. Rename and delete only apply to saved scores.".to_string()
+                                    } else {
+                                        format!(
+                                            "Current score: \"{}\" (id {}).",
+                                            self.selected_document_title(),
+                                            selected_score_id
+                                        )
+                                    }),
                             ),
-                    ),
-            )
-            .child(self.tutorial_panel(window, cx, previous_lesson, next_lesson, load_example))
-            .into_any_element()
-    }
-
-    fn tutorial_panel(
-        &self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-        previous_lesson: Button,
-        next_lesson: Button,
-        load_example: Button,
-    ) -> AnyElement {
-        let lesson = self.current_lesson();
-        let theme = cx.theme();
-
-        div()
-            .flex_1()
-            .min_w(px(0.0))
-            .flex()
-            .flex_col()
-            .gap_3()
-            .p_4()
-            .bg(theme.secondary)
-            .border_1()
-            .border_color(theme.border)
-            .child(
-                div()
-                    .flex()
-                    .items_start()
-                    .justify_between()
-                    .gap_3()
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_size(px(16.0))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child("Tutorial"),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(13.0))
-                                    .text_color(theme.muted_foreground)
-                                    .child(format!(
-                                        "Lesson {} of {}: {}",
-                                        self.tutorial_index + 1,
-                                        LESSONS.len(),
-                                        lesson.title
-                                    )),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(12.0))
-                                    .text_color(theme.muted_foreground)
-                                    .child(lesson.summary),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(previous_lesson)
-                            .child(next_lesson)
-                            .child(load_example),
-                    ),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_h(px(0.0))
-                    .overflow_hidden()
-                    .child(
-                        TextView::markdown("tutorial-markdown", lesson.markdown, window, cx)
-                            .scrollable(true)
-                            .selectable(true)
-                            .size_full(),
                     ),
             )
             .into_any_element()
@@ -1019,7 +1007,7 @@ impl StudioApp {
 }
 
 impl Render for StudioApp {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let view = cx.entity();
         let render_is_running = self.render_phase == RenderPhase::Rendering;
         let has_preview = !self.preview_pages.is_empty();
@@ -1090,37 +1078,6 @@ impl Render for StudioApp {
                 }
             });
 
-        let previous_lesson = Button::new("previous-lesson")
-            .label("Previous")
-            .disabled(self.tutorial_index == 0)
-            .on_click({
-                let view = view.clone();
-                move |_, _, cx| {
-                    let _ = view.update(cx, |studio, cx| studio.previous_lesson(cx));
-                }
-            });
-
-        let next_lesson = Button::new("next-lesson")
-            .label("Next")
-            .disabled(self.tutorial_index + 1 >= LESSONS.len())
-            .on_click({
-                let view = view.clone();
-                move |_, _, cx| {
-                    let _ = view.update(cx, |studio, cx| studio.next_lesson(cx));
-                }
-            });
-
-        let load_example = Button::new("load-lesson-example")
-            .label("Load Example")
-            .on_click({
-                let view = view.clone();
-                move |_, window, cx| {
-                    let _ = view.update(cx, |studio, cx| {
-                        studio.load_current_lesson_example(window, cx)
-                    });
-                }
-            });
-
         let preview_meta = if self.preview_pages.is_empty() {
             "No pages yet".to_string()
         } else {
@@ -1145,13 +1102,7 @@ impl Render for StudioApp {
                 .flex_1()
                 .min_h(px(0.0))
                 .p_4()
-                .child(self.score_library_screen(
-                    window,
-                    cx,
-                    previous_lesson,
-                    next_lesson,
-                    load_example,
-                ))
+                .child(self.score_library_screen(cx))
                 .into_any_element(),
         };
         let theme = cx.theme();

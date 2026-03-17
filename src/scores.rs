@@ -6,7 +6,6 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::tutorial::default_source;
 
@@ -347,6 +346,7 @@ fn app_data_root() -> PathBuf {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[derive(Default)]
     struct InMemoryScoreStore {

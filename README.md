@@ -7,7 +7,7 @@ Desktop LilyPond scratchpad built with Rust, `gpui`, and `gpui-component`.
 - GPUI desktop UI with a multiline LilyPond editor
 - LilyPond CLI integration that renders fresh SVG pages on demand
 - In-app preview for the generated score pages
-- Embedded tutorial section with LilyPond syntax lessons and loadable examples
+- Tutorial scores listed in the file library that open directly in the editor
 
 ## Requirements
 
